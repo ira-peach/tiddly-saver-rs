@@ -17,7 +17,7 @@ use std::env;
 use std::env::Args;
 use std::collections::VecDeque;
 use std::io::Read;
-use std::io::Result;
+use std::io;
 use std::fs;
 use std::fs::File;
 use std::time::SystemTime;
@@ -46,7 +46,7 @@ fn template(title: &str, body: &str) -> String {
 </html>"##, title, body)
 }
 
-fn etag_from_path(path: &str) -> Result<String> {
+fn etag_from_path(path: &str) -> io::Result<String> {
     let data = read_file(path)?;
     return Ok(etag(&data));
 }
@@ -59,13 +59,13 @@ fn etag(data: &Vec<u8>) -> String {
     return etag;
 }
 
-fn read_file(path: &str) -> Result<Vec<u8>> {
+fn read_file(path: &str) -> io::Result<Vec<u8>> {
     let file = File::open(path)?;
     let data = read_data(file)?;
     return Ok(data);
 }
 
-fn read_data(mut file: File) -> Result<Vec<u8>> {
+fn read_data(mut file: File) -> io::Result<Vec<u8>> {
     let mut data = Vec::new();
     file.read_to_end(&mut data)?;
     return Ok(data);
@@ -187,7 +187,7 @@ fn generate_response(request: &Request, runtime_options: &RuntimeOptions) -> Res
     return Response::html(template("404 NOT FOUND", "<h1>404 NOT FOUND</h1>")).with_status_code(404);
 }
 
-fn parse_options(args: Args) -> RuntimeOptions {
+fn parse_options(args: Args) -> Result<RuntimeOptions,String> {
     let short_opt_re = Regex::new(r"^-[0-9A-Za-z][0-9A-Za-z]+$").unwrap();
     let char_re = Regex::new(r".").unwrap();
 
@@ -195,6 +195,11 @@ fn parse_options(args: Args) -> RuntimeOptions {
     runtime_options.debug = false;
     runtime_options.verbose = false;
     let mut args: VecDeque<_> = args.collect();
+    let exe = args.pop_front();
+    if exe.is_none() {
+        return Err("somehow there is no executable for ARGV[0]".to_string());
+    }
+
     loop {
         let arg = args.pop_front();
         if arg.is_none() {
@@ -227,13 +232,29 @@ fn parse_options(args: Args) -> RuntimeOptions {
             }
             runtime_options.verbose = true;
         }
+        else {
+            return Err(format!("unexpected argument: '{}'", arg));
+        }
     }
-    return runtime_options;
+
+    if !args.is_empty() {
+        let mut err = "unexpected remaining arguments:".to_string();
+        for arg in args {
+            err = format!("{} '{}'", err, arg.replace("'", "\\'"));
+        }
+        return Err(err);
+    }
+    return Ok(runtime_options);
 }
 
 fn main() {
     let args = env::args();
     let runtime_options = parse_options(args);
+    if let Err(err) = runtime_options {
+        eprintln!("ERROR: {}", err);
+        std::process::exit(1);
+    }
+    let runtime_options = runtime_options.unwrap();
 
     println!("You should be able to connect.  If on localhost, this should work:");
     println!();
