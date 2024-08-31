@@ -9,6 +9,8 @@ TODOs:
 - Figure out if name clashes with existing project.
 - Get HTTP basic auth for PUT working
 - Customizability
+- Maybe truly implement WebDAV, or at least remove WebDAV check and only rely
+  on OPTIONS header response.
 
 License
 =======
