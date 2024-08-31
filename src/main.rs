@@ -14,6 +14,7 @@
 // You should have received a copy of the GNU Affero General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 use std::env;
+use std::env::Args;
 use std::collections::VecDeque;
 use std::io::Read;
 use std::io::Result;
@@ -25,7 +26,7 @@ use chrono::DateTime;
 use chrono::Utc;
 use sha2::{Sha512, Digest};
 use regex::Regex;
-//use rouille::Request;
+use rouille::Request;
 use rouille::Response;
 
 fn template(title: &str, body: &str) -> String {
@@ -65,12 +66,127 @@ fn read_data(mut file: File) -> Result<Vec<u8>> {
     return Ok(data);
 }
 
-fn main() {
+#[derive(Default)]
+struct RuntimeOptions {
+    debug: bool,
+    verbose: bool,
+}
+
+fn generate_response(request: &Request, runtime_options: &RuntimeOptions) -> Response {
+    let method = request.method();
+    let remote = request.remote_addr();
+    let url_path = request.url();
+
+    println!("INFO: connection from '{}': {} '{}'", remote, method, url_path);
+
+    if runtime_options.debug {
+        eprintln!("DEBUG: {:?}", request);
+    }
+
+    if method == "GET" {
+        if url_path == "/" {
+            return Response::redirect_303("/index.html");
+        }
+        else if url_path == "/index.html" {
+            let data = read_file("index.html");
+            if let Err(err) = data {
+                eprintln!("ERROR: could not read from 'index.html': {}", err);
+                return Response::html(template("500 INTERNAL SERVER ERROR", "<h1>500 INTERNAL SERVER ERROR</h1>")).with_status_code(500);
+            }
+            let data = data.unwrap();
+            let etag = etag(&data);
+            if runtime_options.debug {
+                eprintln!("DEBUG: etag: {}", etag);
+            }
+            return Response::from_data("text/html", data).with_etag(request, etag);
+        }
+        else {
+            return Response::html(template("404 NOT FOUND", "<h1>404 NOT FOUND</h1>")).with_status_code(404);
+        }
+    }
+    else if method == "HEAD" {
+        if url_path == "/" {
+            return Response::redirect_303("/index.html");
+        }
+        else if url_path == "/index.html" {
+            let data = read_file("index.html");
+            if let Err(err) = data {
+                eprintln!("ERROR: could not read from 'index.html': {}", err);
+                return Response::html(template("500 INTERNAL SERVER ERROR", "<h1>500 INTERNAL SERVER ERROR</h1>")).with_status_code(500);
+            }
+            let data = data.unwrap();
+            let etag = etag(&data);
+            if runtime_options.debug {
+                eprintln!("DEBUG: etag: {}", etag);
+            }
+            return Response::text("").with_status_code(200).with_etag(request, etag);
+        }
+        else {
+            return Response::html(template("404 NOT FOUND", "<h1>404 NOT FOUND</h1>")).with_status_code(404);
+        }
+    }
+    else if method == "OPTIONS" {
+        if url_path == "/index.html" {
+            return Response::text("").with_unique_header("allow", "OPTIONS, GET, HEAD, PUT").with_unique_header("dav", "1");
+        }
+        else if url_path == "*" {
+            return Response::text("").with_unique_header("allow", "OPTIONS, GET");
+        }
+        else {
+            return Response::text("").with_unique_header("allow", "OPTIONS, GET");
+        }
+    }
+    else if method == "PUT" {
+        if url_path == "/index.html" {
+            let now = SystemTime::now();
+            let now: DateTime<Utc> = now.into();
+            let now = now.to_rfc3339();
+            let backup_name = format!("index-{}.html", now);
+            let backup_name = backup_name.replace(":", "");
+            let result = fs::copy("index.html", &backup_name);
+            if let Err(err) = result {
+                eprintln!("ERROR: trying to copy from '{}' to '{}': {}", "index.html", backup_name, err);
+                return Response::html(template("500 INTERNAL SERVER ERROR", "<h1>500 INTERNAL SERVER ERROR</h1>")).with_status_code(500);
+            }
+            let data = request.data();
+            if let Err(err) = result {
+                eprintln!("ERROR: 0003: {}", err);
+                return Response::html(template("500 INTERNAL SERVER ERROR", "<h1>500 INTERNAL SERVER ERROR</h1>")).with_status_code(500);
+            }
+            let mut data = data.unwrap();
+            let mut buf = Vec::new();
+            let result = data.read_to_end(&mut buf);
+            if let Err(err) = result {
+                eprintln!("ERROR: 0002: {}", err);
+                return Response::html(template("500 INTERNAL SERVER ERROR", "<h1>500 INTERNAL SERVER ERROR</h1>")).with_status_code(500);
+            }
+            let etag = etag(&buf);
+            let content = String::from_utf8(buf);
+            if let Err(err) = content {
+                eprintln!("ERROR: 0001: {}", err);
+                return Response::html(template("400 INTERNAL SERVER ERROR", "<h1>400 BAD REQUEST</h1>")).with_status_code(400);
+            }
+            let content = content.unwrap();
+            let result = fs::write("index.html", content);
+            if let Err(err) = result {
+                eprintln!("ERROR: 0005: {}", err);
+                return Response::html(template("500 INTERNAL SERVER ERROR", "<h1>500 INTERNAL SERVER ERROR</h1>")).with_status_code(500);
+            }
+            return Response::empty_204().with_etag(request, etag);
+        }
+        return Response::html(template("405 METHOD NOT ALLOWED", "<p>405 METHOD NOT ALLOWED</p>")).with_status_code(405);
+    }
+    return Response::html(template("405 METHOD NOT ALLOWED", "<p>405 METHOD NOT ALLOWED</p>")).with_status_code(405);
+}
+
+fn parse_options(args: Args) -> RuntimeOptions {
     let short_opt_re = Regex::new(r"^-[0-9A-Za-z][0-9A-Za-z]+$").unwrap();
     let char_re = Regex::new(r".").unwrap();
-    let mut debug = false;
-    let mut verbose = false;
-    let mut args: VecDeque<_> = env::args().collect();
+
+    let mut runtime_options: RuntimeOptions = Default::default();
+    runtime_options.debug = false;
+    runtime_options.verbose = false;
+    let mut args: VecDeque<_> = args.collect();
     loop {
         let arg = args.pop_front();
         if arg.is_none() {
@@ -98,12 +214,18 @@ fn main() {
             continue;
         }
         else if arg == "-v" || arg == "--verbose" {
-            if verbose {
-                debug = true;
+            if runtime_options.verbose {
+                runtime_options.debug = true;
             }
-            verbose = true;
+            runtime_options.verbose = true;
         }
     }
+    return runtime_options;
+}
+
+fn main() {
+    let args = env::args();
+    let runtime_options = parse_options(args);
 
     println!("You should be able to connect.  If on localhost, this should work:");
     println!();
@@ -113,132 +235,11 @@ fn main() {
         let method = request.method();
         let remote = request.remote_addr();
         let url_path = request.url();
-
-        println!("INFO: connection from '{}': {} '{}'", remote, method, url_path);
-
-        if debug {
-            eprintln!("DEBUG: {:?}", request);
-        }
-
-        let response;
-
-        if method == "GET" {
-            if url_path == "/" {
-                response = Response::redirect_303("/index.html");
-            }
-            else if url_path == "/index.html" {
-                let data = read_file("index.html");
-                if let Err(err) = data {
-                    eprintln!("ERROR: could not read from 'index.html': {}", err);
-                    response = Response::html(template("500 INTERNAL SERVER ERROR", "<h1>500 INTERNAL SERVER ERROR</h1>")).with_status_code(500);
-                }
-                else {
-                    let data = data.unwrap();
-                    let etag = etag(&data);
-                    if debug {
-                        eprintln!("DEBUG: etag: {}", etag);
-                    }
-                    response = Response::from_data("text/html", data).with_etag(request, etag);
-                }
-            }
-            else {
-                response = Response::html(template("404 NOT FOUND", "<h1>404 NOT FOUND</h1>")).with_status_code(404);
-            }
-        }
-        else if method == "HEAD" {
-            if url_path == "/" {
-                response = Response::redirect_303("/index.html");
-            }
-            else if url_path == "/index.html" {
-                let data = read_file("index.html");
-                if let Err(err) = data {
-                    eprintln!("ERROR: could not read from 'index.html': {}", err);
-                    response = Response::html(template("500 INTERNAL SERVER ERROR", "<h1>500 INTERNAL SERVER ERROR</h1>")).with_status_code(500);
-                }
-                else {
-                    let data = data.unwrap();
-                    let etag = etag(&data);
-                    if debug {
-                        eprintln!("DEBUG: etag: {}", etag);
-                    }
-                    response = Response::text("").with_status_code(200).with_etag(request, etag);
-                }
-            }
-            else {
-                response = Response::html(template("404 NOT FOUND", "<h1>404 NOT FOUND</h1>")).with_status_code(404);
-            }
-        }
-        else if method == "OPTIONS" {
-            if url_path == "/index.html" {
-                response = Response::text("").with_unique_header("allow", "OPTIONS, GET, HEAD, PUT").with_unique_header("dav", "1");
-            }
-            else if url_path == "*" {
-                response = Response::text("").with_unique_header("allow", "OPTIONS, GET");
-            }
-            else {
-                response = Response::text("").with_unique_header("allow", "OPTIONS, GET");
-            }
-        }
-        else if method == "PUT" {
-            if url_path == "/index.html" {
-                let now = SystemTime::now();
-                let now: DateTime<Utc> = now.into();
-                let now = now.to_rfc3339();
-                let backup_name = format!("index-{}.html", now);
-                let backup_name = backup_name.replace(":", "");
-                let result = fs::copy("index.html", &backup_name);
-                if let Err(err) = result {
-                    eprintln!("ERROR: trying to copy from '{}' to '{}': {}", "index.html", backup_name, err);
-                    response = Response::html(template("500 INTERNAL SERVER ERROR", "<h1>500 INTERNAL SERVER ERROR</h1>")).with_status_code(500);
-                }
-                else {
-                    let data = request.data();
-                    if let Err(err) = result {
-                        eprintln!("ERROR: 0003: {}", err);
-                        response = Response::html(template("500 INTERNAL SERVER ERROR", "<h1>500 INTERNAL SERVER ERROR</h1>")).with_status_code(500);
-                    }
-                    else {
-                        let mut data = data.unwrap();
-                        let mut buf = Vec::new();
-                        let result = data.read_to_end(&mut buf);
-                        if let Err(err) = result {
-                            eprintln!("ERROR: 0002: {}", err);
-                            response = Response::html(template("500 INTERNAL SERVER ERROR", "<h1>500 INTERNAL SERVER ERROR</h1>")).with_status_code(500);
-                        }
-                        else {
-                            let etag = etag(&buf);
-                            let content = String::from_utf8(buf);
-                            if let Err(err) = content {
-                                eprintln!("ERROR: 0001: {}", err);
-                                response = Response::html(template("400 INTERNAL SERVER ERROR", "<h1>400 BAD REQUEST</h1>")).with_status_code(400);
-                            }
-                            else {
-                                let content = content.unwrap();
-                                let result = fs::write("index.html", content);
-                                if let Err(err) = result {
-                                    eprintln!("ERROR: 0005: {}", err);
-                                    response = Response::html(template("500 INTERNAL SERVER ERROR", "<h1>500 INTERNAL SERVER ERROR</h1>")).with_status_code(500);
-                                }
-                                else {
-                                    response = Response::empty_204().with_etag(request, etag);
-                                }
-                            }
-                        }
-                        //let result = fs::write("index.html", data);
-                    }
-                }
-            }
-            else {
-                response = Response::html(template("405 METHOD NOT ALLOWED", "<p>405 METHOD NOT ALLOWED</p>")).with_status_code(405);
-            }
-        }
-        else {
-            response = Response::html(template("405 METHOD NOT ALLOWED", "<p>405 METHOD NOT ALLOWED</p>")).with_status_code(405);
-        }
+        let response = generate_response(&request, &runtime_options);
 
         println!("VERBOSE: returning response to '{}' for {} '{}': {}", remote, method, url_path, response.status_code);
 
-        if debug {
+        if runtime_options.debug {
             eprintln!("DEBUG: {:?}", response);
         }
 
