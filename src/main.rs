@@ -46,6 +46,11 @@ fn template(title: &str, body: &str) -> String {
 </html>"##, title, body)
 }
 
+fn etag_from_path(path: &str) -> Result<String> {
+    let data = read_file(path)?;
+    return Ok(etag(&data));
+}
+
 fn etag(data: &Vec<u8>) -> String {
     let mut hasher = Sha512::new();
     hasher.update(&data);
@@ -83,11 +88,17 @@ fn generate_response(request: &Request, runtime_options: &RuntimeOptions) -> Res
         eprintln!("DEBUG: {:?}", request);
     }
 
-    if method == "GET" {
-        if url_path == "/" {
+    if url_path == "/" {
+        if method == "GET" {
             return Response::redirect_303("/index.html");
         }
-        else if url_path == "/index.html" {
+        else if method == "HEAD" {
+            return Response::redirect_303("/index.html");
+        }
+        return Response::html(template("405 METHOD NOT ALLOWED", "<p>405 METHOD NOT ALLOWED</p>")).with_status_code(405);
+    }
+    else if url_path == "/index.html" {
+        if method == "GET" {
             let data = read_file("index.html");
             if let Err(err) = data {
                 eprintln!("ERROR: could not read from 'index.html': {}", err);
@@ -100,15 +111,7 @@ fn generate_response(request: &Request, runtime_options: &RuntimeOptions) -> Res
             }
             return Response::from_data("text/html", data).with_etag(request, etag);
         }
-        else {
-            return Response::html(template("404 NOT FOUND", "<h1>404 NOT FOUND</h1>")).with_status_code(404);
-        }
-    }
-    else if method == "HEAD" {
-        if url_path == "/" {
-            return Response::redirect_303("/index.html");
-        }
-        else if url_path == "/index.html" {
+        else if method == "HEAD" {
             let data = read_file("index.html");
             if let Err(err) = data {
                 eprintln!("ERROR: could not read from 'index.html': {}", err);
@@ -121,23 +124,22 @@ fn generate_response(request: &Request, runtime_options: &RuntimeOptions) -> Res
             }
             return Response::text("").with_status_code(200).with_etag(request, etag);
         }
-        else {
-            return Response::html(template("404 NOT FOUND", "<h1>404 NOT FOUND</h1>")).with_status_code(404);
-        }
-    }
-    else if method == "OPTIONS" {
-        if url_path == "/index.html" {
+        else if method == "OPTIONS" {
             return Response::text("").with_unique_header("allow", "OPTIONS, GET, HEAD, PUT").with_unique_header("dav", "1");
         }
-        else if url_path == "*" {
-            return Response::text("").with_unique_header("allow", "OPTIONS, GET");
-        }
-        else {
-            return Response::text("").with_unique_header("allow", "OPTIONS, GET");
-        }
-    }
-    else if method == "PUT" {
-        if url_path == "/index.html" {
+        else if method == "PUT" {
+            if let Some(header_etag) = request.header("if-match") {
+                let etag = etag_from_path("index.html");
+                if let Err(err) = etag {
+                    eprintln!("ERROR: trying to get etag from path 'index.html': {}", err);
+                    return Response::html(template("500 INTERNAL SERVER ERROR", "<h1>500 INTERNAL SERVER ERROR</h1>")).with_status_code(500);
+                }
+                let etag = etag.unwrap();
+                if etag == header_etag {
+                    println!("INFO: request header etag matches generated etag '{}'; no action required", etag);
+                    return Response::empty_204().with_etag(request, etag);
+                }
+            }
             let now = SystemTime::now();
             let now: DateTime<Utc> = now.into();
             let now = now.to_rfc3339();
@@ -176,7 +178,13 @@ fn generate_response(request: &Request, runtime_options: &RuntimeOptions) -> Res
         }
         return Response::html(template("405 METHOD NOT ALLOWED", "<p>405 METHOD NOT ALLOWED</p>")).with_status_code(405);
     }
-    return Response::html(template("405 METHOD NOT ALLOWED", "<p>405 METHOD NOT ALLOWED</p>")).with_status_code(405);
+    else if url_path == "*" {
+        return Response::text("").with_unique_header("allow", "OPTIONS");
+    }
+    else if method == "OPTIONS" {
+        return Response::text("").with_unique_header("allow", "OPTIONS");
+    }
+    return Response::html(template("404 NOT FOUND", "<h1>404 NOT FOUND</h1>")).with_status_code(404);
 }
 
 fn parse_options(args: Args) -> RuntimeOptions {
