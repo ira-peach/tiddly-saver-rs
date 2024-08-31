@@ -104,6 +104,11 @@ fn main() {
             verbose = true;
         }
     }
+
+    println!("You should be able to connect.  If on localhost, this should work:");
+    println!();
+    println!("  http://127.0.0.1:8082");
+
     rouille::start_server("0.0.0.0:8082", move |request| {
         let method = request.method();
         let remote = request.remote_addr();
