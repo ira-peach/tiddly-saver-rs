@@ -14,35 +14,42 @@
 //
 // You should have received a copy of the GNU Affero General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
+use std::collections::VecDeque;
 use std::env;
 use std::env::Args;
-use std::collections::VecDeque;
-use std::io::Read;
-use std::io;
 use std::fs;
 use std::fs::File;
-use std::time::SystemTime;
+use std::io;
+use std::io::Read;
 use std::process::exit;
+use std::time::SystemTime;
 
 use base64::prelude::*;
 use chrono::DateTime;
 use chrono::Days;
 use chrono::Utc;
+use password_auth::VerifyError::Parse;
+use password_auth::VerifyError::PasswordInvalid;
 use password_auth::generate_hash;
 use password_auth::verify_password;
+use rand::Rng;
+use rand::distributions::Alphanumeric;
 use regex::Regex;
 use rouille::Request;
 use rouille::Response;
+use rouille::input::cookies;
 use rouille::post_input;
 use rouille::try_or_400;
 use sha2::{Sha512, Digest};
 use sqlite;
 use sqlite::Connection;
-use sqlite::State;
+use sqlite::ConnectionThreadSafe;
 use sqlite::ReadableWithIndex;
-use rand::distributions::Alphanumeric;
-use rand::Rng;
+use sqlite::State;
 
+/// Make a basic template given a title and body.
+///
+/// Body text should not include surround `<body>...</body>`.
 fn template(title: &str, body: &str) -> String {
     format!(r##"<!doctype html>
 <html lang="en-US">
@@ -60,6 +67,7 @@ fn template(title: &str, body: &str) -> String {
 </html>"##, title, body)
 }
 
+/// Runtime options from command line arguments.
 #[derive(Clone,Debug,Default)]
 struct RuntimeOptions {
     debug: bool,
@@ -68,23 +76,26 @@ struct RuntimeOptions {
     database_path: Option<&'static str>,
 }
 
+/// User
 #[derive(Clone,Debug)]
 struct CredentialInfo {
-    user_name: String,
+    name: String,
     password_hash: String,
     password_salt: String,
 }
 
 impl CredentialInfo {
-    pub fn new(user_name: String, password_hash: String, password_salt: String) -> CredentialInfo {
+    /// Create a record of name, password hash, and salt.
+    pub fn new(name: String, password_hash: String, password_salt: String) -> CredentialInfo {
         CredentialInfo {
-            user_name,
+            name,
             password_hash,
             password_salt,
         }
     }
 }
 
+/// Get a user's credential information.
 fn get_user_info(connection: &Connection, user: &str) -> Result<Option<CredentialInfo>,sqlite::Error> {
     let query = "SELECT password_hash, password_salt FROM user WHERE name = ?;";
     let mut statement = connection.prepare(query)?;
@@ -104,6 +115,10 @@ fn get_user_info(connection: &Connection, user: &str) -> Result<Option<Credentia
     Ok(info)
 }
 
+/// Test if a session ID represents a logged in user session.
+///
+/// This is distinct from authorization, though for this app authentication is
+/// authorization; will be different for any admin dashboard.
 fn is_authenticated(connection: &Connection, session_id: &str) -> Result<bool,sqlite::Error> {
     let query = "SELECT session_id, expires_utc FROM authentication WHERE session_id = ?;";
     let mut statement = connection.prepare(query)?;
@@ -128,6 +143,7 @@ fn is_authenticated(connection: &Connection, session_id: &str) -> Result<bool,sq
     };
 }
 
+/// Get a single value T from a database query.
 fn get_single<T: ReadableWithIndex>(connection: &Connection, query: &str, column: &str) -> Result<T,sqlite::Error> {
     let mut statement = connection.prepare(query)?;
     statement.next()?;
@@ -135,10 +151,12 @@ fn get_single<T: ReadableWithIndex>(connection: &Connection, query: &str, column
     Ok(result)
 }
 
+/// Generate a random alphanumeric string of specific length.
 fn random_string(length: usize) -> String {
     rand::thread_rng().sample_iter(&Alphanumeric).take(length).map(char::from).collect()
 }
 
+/// Update a user's credential information.
 fn update_user(connection: &Connection, user: &str, salt: &str, hashed: &str) -> Result<(),sqlite::Error> {
     let mut statement = connection.prepare("UPDATE user SET password_salt=?, password_hash=? WHERE name=?;")?;
     statement.bind((1, salt))?;
@@ -149,6 +167,7 @@ fn update_user(connection: &Connection, user: &str, salt: &str, hashed: &str) ->
     Ok(())
 }
 
+/// Add a user's credential information.
 fn add_user(connection: &Connection, user: &str, salt: &str, hashed: &str) -> Result<(),sqlite::Error> {
     let mut statement = connection.prepare("INSERT INTO user (name, password_hash, password_salt) VALUES (?, ?, ?);")?;
     statement.bind((1, user))?;
@@ -159,7 +178,6 @@ fn add_user(connection: &Connection, user: &str, salt: &str, hashed: &str) -> Re
     Ok(())
 }
 
-use sqlite::ConnectionThreadSafe;
 
 /// Salt and hash a password
 ///
@@ -259,11 +277,22 @@ fn init_db(path: &str, recreate_admin: bool) -> Result<ConnectionThreadSafe, sql
     Ok(connection)
 }
 
+/// Generate an etag from a file path.
+///
+/// This is simply a sha512 hash of the file content via the sha512() function.
 fn etag_from_path(path: &str) -> io::Result<String> {
     let data = read_file(path)?;
     return Ok(sha512(&data));
 }
 
+/// Generate an etag for some data.
+///
+/// This is simply a sha512 hash of the data via the sha512() function.
+fn etag(data: impl AsRef<[u8]>) -> String {
+    sha512(&data)
+}
+
+/// Generate a hexadecimal string representing a sha512sum.
 fn sha512(data: impl AsRef<[u8]>) -> String {
     let mut hasher = Sha512::new();
     hasher.update(&data);
@@ -272,37 +301,50 @@ fn sha512(data: impl AsRef<[u8]>) -> String {
     return etag;
 }
 
+/// Read a file from a given path.
 fn read_file(path: &str) -> io::Result<Vec<u8>> {
     let file = File::open(path)?;
     let data = read_data(file)?;
     return Ok(data);
 }
 
+/// Read data from a given file.
 fn read_data(mut file: File) -> io::Result<Vec<u8>> {
     let mut data = Vec::new();
     file.read_to_end(&mut data)?;
     return Ok(data);
 }
 
+/// Generate a 400 bad request response with the specific body.
+///
+/// Generates a body via the template() function; don't include the surrounding
+/// `<body>...</body>` tags.
 fn bad_request_with(msg: String) -> Response {
     let body = format!("<h1>400 BAD REQUEST</h1>{}", msg);
     Response::html(template("400 BAD REQUEST", &body)).with_status_code(400)
 }
 
+/// Generate a 400 bad request response with a generic body.
 fn bad_request() -> Response {
     let body = "<h1>400 BAD REQUEST</h1>";
     Response::html(template("400 BAD REQUEST", &body)).with_status_code(400)
 }
 
+/// Generate a 401 unauthorized response with a generic body.
 fn unauthorized() -> Response {
     Response::html(template("401 UNAUTHORIZED", "<h1>401 UNAUTHORIZED</h1><p>Please authenticate</p>")).with_status_code(401)
 }
 
+/// Generate a 401 unauthorized response with the specific body.
+///
+/// Generates a body via the template() function; don't include the surrounding
+/// `<body>...</body>` tags.
 fn unauthorized_with(body: &str) -> Response {
     let body = format!("<h1>401 UNAUTHORIZED</h1><p>{}</p>", body);
     Response::html(template("401 UNAUTHORIZED", &body)).with_status_code(401)
 }
 
+/// Add a user authentication record.
 fn add_user_authentication(connection: &Connection, user: &str, session_id: &str, expires_absolute: &str) -> Result<(),sqlite::Error> {
     let mut statement = connection.prepare("SELECT user_id FROM user WHERE name = ?;")?;
     statement.bind((1, user))?;
@@ -323,7 +365,8 @@ fn add_user_authentication(connection: &Connection, user: &str, session_id: &str
     Ok(())
 }
 
-fn authenticate(connection: &Connection, request: &Request, dry_run: bool) -> Response {
+/// Authenticate a user for login.
+fn authenticate(connection: &Connection, request: &Request) -> Response {
     let input = post_input!(request, {
         user: String,
         password: String,
@@ -350,8 +393,6 @@ fn authenticate(connection: &Connection, request: &Request, dry_run: bool) -> Re
     let salted_hash = salt_and_hash(&user_info.password_salt, input.password);
     let authenticated = match verify_password(salted_hash, &user_info.password_hash) {
         Err(err) => {
-            use password_auth::VerifyError::Parse;
-            use password_auth::VerifyError::PasswordInvalid;
             match err {
                 PasswordInvalid => false,
                 Parse(err) => {
@@ -389,20 +430,29 @@ fn authenticate(connection: &Connection, request: &Request, dry_run: bool) -> Re
     Response::html(template("LOGGED IN", "<h1>You are now logged in!  You may proceed to <a href=\"/index.html\">the wiki</a>!")).with_unique_header("Set-Cookie", cookie)
 }
 
+/// Generate a 500 internal server error response.
 fn internal_server_error() -> Response {
     Response::html(template("500 INTERNAL SERVER ERROR", "<h1>500 INTERNAL SERVER ERROR</h1>")).with_status_code(500)
 }
 
+/// Generate an options response with the specific allow header value.
+///
+/// The allow header value should be a comma-space separated list of each method allowed,
+/// e.g.  "PUT, HEAD, GET" or "PUT".
 fn options_response(options: &str) -> Response {
     Response::text("").with_unique_header("allow", options.to_string())
 }
 
+/// Generate a 405 method not allowed response.
 fn method_not_allowed() -> Response {
     Response::html(template("405 METHOD NOT ALLOWED", "<p>405 METHOD NOT ALLOWED</p>")).with_status_code(405)
 }
 
-use rouille::input::cookies;
-
+/// Authorize a user's session.
+///
+/// This really just checks if the user is authenticated.  Here is where roles of a user
+/// should be checked, or if an admin user is being user (which will be authorized to do
+/// everything).
 fn authorize(connection: &Connection, request: &Request) -> Result<(),Response> {
     let cookie_name = "__Host-session_id";
     let session_id = match cookies(&request).find(|&(n, _)| n == cookie_name) {
@@ -426,6 +476,7 @@ fn authorize(connection: &Connection, request: &Request) -> Result<(),Response> 
     Ok(())
 }
 
+/// Log out a session by deleting it from the session records.
 fn delete_user_authentication(connection: &Connection, session_id: &str) -> Result<(),sqlite::Error> {
     let mut statement = connection.prepare("DELETE FROM authentication WHERE session_id = ?;")?;
     statement.bind((1, session_id))?;
@@ -434,6 +485,7 @@ fn delete_user_authentication(connection: &Connection, session_id: &str) -> Resu
     Ok(())
 }
 
+/// Handle a logout request.
 fn logout(connection: &Connection, request: &Request) -> Result<(),Response> {
     let cookie_name = "__Host-session_id";
     let session_id = match cookies(&request).find(|&(n, _)| n == cookie_name) {
@@ -453,6 +505,7 @@ fn logout(connection: &Connection, request: &Request) -> Result<(),Response> {
     Ok(())
 }
 
+/// Generate a response given the request, modified with specific runtime options.
 fn generate_response(connection: &Connection, request: &Request, runtime_options: &RuntimeOptions) -> Response {
     let method = request.method();
     let remote = request.remote_addr();
@@ -481,7 +534,7 @@ fn generate_response(connection: &Connection, request: &Request, runtime_options
             return Response::html(template("Login", r#"<h1>Login</h1> <form method="POST"><div><label for="user">User:</label><input name="user" id=user /></div><div><label for="password">Password:</label><input name="password" id="password" type="password" /></div><div><button>Submit</button></div></form>"#));
         }
         else if method == "POST" {
-            let response = authenticate(connection, request, false);
+            let response = authenticate(connection, request);
             return response;
         }
         else if method == "OPTIONS" {
@@ -507,7 +560,7 @@ fn generate_response(connection: &Connection, request: &Request, runtime_options
                 return internal_server_error();
             }
             let data = data.unwrap();
-            let etag = sha512(&data);
+            let etag = etag(&data);
             if runtime_options.debug {
                 eprintln!("DEBUG: etag: {}", etag);
             }
@@ -520,7 +573,7 @@ fn generate_response(connection: &Connection, request: &Request, runtime_options
                 return internal_server_error();
             }
             let data = data.unwrap();
-            let etag = sha512(&data);
+            let etag = etag(&data);
             if runtime_options.debug {
                 eprintln!("DEBUG: etag: {}", etag);
             }
@@ -557,7 +610,7 @@ fn generate_response(connection: &Connection, request: &Request, runtime_options
                 eprintln!("ERROR: 0002: {}", err);
                 return internal_server_error();
             }
-            let content_etag = sha512(&buf);
+            let content_etag = etag(&buf);
             let etag = etag_from_path("index.html");
             if let Err(err) = etag {
                 eprintln!("ERROR: trying to get etag from path 'index.html': {}", err);
@@ -600,6 +653,10 @@ fn generate_response(connection: &Connection, request: &Request, runtime_options
     return Response::html(template("404 NOT FOUND", "<h1>404 NOT FOUND</h1>")).with_status_code(404);
 }
 
+/// Parse options.
+///
+/// Probably should just use the gumdrop crate, but I made it so I like it, even if it's
+/// leaky.
 fn parse_options(args: Args) -> Result<RuntimeOptions,String> {
     let short_opt_re = Regex::new(r"^-[0-9A-Za-z][0-9A-Za-z]+$").unwrap();
     let char_re = Regex::new(r".").unwrap();
@@ -697,6 +754,7 @@ fn parse_options(args: Args) -> Result<RuntimeOptions,String> {
     return Ok(runtime_options);
 }
 
+/// Parse args, init database, and listen for HTTP connections.
 fn main() {
     let args = env::args();
     let runtime_options = parse_options(args);
